@@ -292,6 +292,8 @@ export function MessageThread({
 
   // 24-hour session timer
   const sessionInfo = useMemo(() => {
+    // QR Code connection (WAHA): WhatsApp has no 24h window there.
+    if (process.env.NEXT_PUBLIC_WHATSAPP_MODE === "waha") return { expired: false, remaining: "" };
     if (!messages.length) return { expired: false, remaining: "" };
 
     // Find last customer message
@@ -1037,6 +1039,7 @@ export function MessageThread({
           </div>
           {/* Session timer badge — hidden on the narrowest phones so
               the name + back arrow keep their room. */}
+          {sessionInfo.remaining && (
           <Badge
             variant="outline"
             className={cn(
@@ -1047,6 +1050,7 @@ export function MessageThread({
             <Clock className="h-3 w-3" />
             {sessionInfo.remaining}
           </Badge>
+          )}
         </div>
 
         <div className="flex items-center gap-2">

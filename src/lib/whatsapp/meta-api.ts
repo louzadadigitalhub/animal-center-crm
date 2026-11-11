@@ -11,6 +11,20 @@
 
 import { isBusinessScopedUserId } from './wa-identity'
 import { getT } from '@/lib/i18n/translate'
+import {
+  isWahaMediaId,
+  isWahaPhoneNumberId,
+  isWahaUrl,
+  jidDigits,
+  wahaDownload,
+  wahaGetSession,
+  wahaReact,
+  wahaSeenAndTyping,
+  wahaSendMedia,
+  wahaSendText,
+  wahaSessionFrom,
+  wahaUrlFromMediaId,
+} from './waha-api'
 
 const ti = getT('Validation.interactive')
 
@@ -133,6 +147,16 @@ export async function verifyPhoneNumber(
   args: VerifyPhoneNumberArgs
 ): Promise<MetaPhoneInfo> {
   const { phoneNumberId, accessToken } = args
+  if (isWahaPhoneNumberId(phoneNumberId)) {
+    const session = await wahaGetSession(wahaSessionFrom(phoneNumberId))
+    if (!session) throw new Error('Sessão do WhatsApp (QR Code) não encontrada no WAHA.')
+    return {
+      id: phoneNumberId,
+      display_phone_number: jidDigits(session.me?.id) || session.status,
+      verified_name: session.me?.pushName,
+      quality_rating: session.status === 'WORKING' ? 'GREEN' : 'RED',
+    }
+  }
   const url = `${META_API_BASE}/${phoneNumberId}?fields=id,display_phone_number,verified_name,quality_rating`
   const response = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
@@ -147,6 +171,15 @@ export async function getPhoneNumberHealth(
   args: VerifyPhoneNumberArgs
 ): Promise<MetaPhoneHealth> {
   const { phoneNumberId, accessToken } = args
+  if (isWahaPhoneNumberId(phoneNumberId)) {
+    const session = await wahaGetSession(wahaSessionFrom(phoneNumberId))
+    if (!session) throw new Error('Sessão do WhatsApp (QR Code) não encontrada no WAHA.')
+    return {
+      id: phoneNumberId,
+      display_phone_number: jidDigits(session.me?.id) || session.status,
+      quality_rating: session.status === 'WORKING' ? 'GREEN' : 'RED',
+    }
+  }
   const headers = { Authorization: `Bearer ${accessToken}` }
   const [response, limitResponse] = await Promise.all([
     fetch(`${META_API_BASE}/${phoneNumberId}?fields=id,display_phone_number,quality_rating`, { headers }),
@@ -395,6 +428,9 @@ export async function sendTextMessage(
   args: SendTextMessageArgs
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, text, contextMessageId } = args
+  if (isWahaPhoneNumberId(phoneNumberId)) {
+    return wahaSendText({ session: wahaSessionFrom(phoneNumberId), to, text, replyTo: contextMessageId })
+  }
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const body: Record<string, unknown> = {
     messaging_product: 'whatsapp',
@@ -452,6 +488,18 @@ export async function sendMediaMessage(
   args: SendMediaMessageArgs,
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, kind, link, caption, filename, contextMessageId } = args
+  if (isWahaPhoneNumberId(phoneNumberId)) {
+    if (!link) throw new Error('sendMediaMessage requires a link.')
+    return wahaSendMedia({
+      session: wahaSessionFrom(phoneNumberId),
+      to,
+      kind,
+      link,
+      caption,
+      filename,
+      replyTo: contextMessageId,
+    })
+  }
   if (!link) throw new Error('sendMediaMessage requires a link.')
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
 
@@ -547,6 +595,9 @@ export async function sendTemplateMessage(
     messageParams,
     contextMessageId,
   } = args
+  if (isWahaPhoneNumberId(args.phoneNumberId)) {
+    throw new Error('Modelos (templates) da Meta não funcionam na conexão por QR Code (WAHA).')
+  }
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
 
   const templatePayload: Record<string, unknown> = {
@@ -840,6 +891,9 @@ export async function sendReactionMessage(
   args: SendReactionMessageArgs
 ): Promise<MetaSendResult> {
   const { phoneNumberId, accessToken, to, targetMessageId, emoji } = args
+  if (isWahaPhoneNumberId(phoneNumberId)) {
+    return wahaReact({ session: wahaSessionFrom(phoneNumberId), messageId: targetMessageId, emoji })
+  }
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const response = await fetch(url, {
     method: 'POST',
@@ -891,6 +945,10 @@ export async function sendTypingIndicator(
   args: SendTypingIndicatorArgs
 ): Promise<void> {
   const { phoneNumberId, accessToken, messageId } = args
+  if (isWahaPhoneNumberId(phoneNumberId)) {
+    await wahaSeenAndTyping({ session: wahaSessionFrom(phoneNumberId), inboundMessageId: messageId })
+    return
+  }
   const url = `${META_API_BASE}/${phoneNumberId}/messages`
   const response = await fetch(url, {
     method: 'POST',
@@ -977,6 +1035,9 @@ export async function sendInteractiveButtons(
     phoneNumberId, accessToken, to,
     bodyText, headerText, footerText, buttons, contextMessageId,
   } = args
+  if (isWahaPhoneNumberId(args.phoneNumberId)) {
+    throw new Error('Botões interativos não funcionam na conexão por QR Code (WAHA).')
+  }
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (buttons.length < 1 || buttons.length > INTERACTIVE_LIMITS.maxButtons) {
@@ -1084,6 +1145,9 @@ export async function sendInteractiveList(
     phoneNumberId, accessToken, to,
     bodyText, buttonLabel, headerText, footerText, sections, contextMessageId,
   } = args
+  if (isWahaPhoneNumberId(args.phoneNumberId)) {
+    throw new Error('Listas interativas não funcionam na conexão por QR Code (WAHA).')
+  }
   validateInteractiveBody(bodyText)
   validateInteractiveHeaderFooter(headerText, footerText)
   if (!buttonLabel) throw new Error(ti('listRequiresButtonLabel'))
@@ -1218,6 +1282,9 @@ export async function getMediaUrl(
   args: GetMediaUrlArgs
 ): Promise<{ url: string; mimeType: string; fileSize: number | null }> {
   const { mediaId, accessToken } = args
+  if (isWahaMediaId(mediaId)) {
+    return { url: wahaUrlFromMediaId(mediaId), mimeType: 'application/octet-stream', fileSize: null }
+  }
   const response = await fetch(`${META_API_BASE}/${mediaId}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   })
@@ -1249,6 +1316,7 @@ export async function downloadMedia(
   args: DownloadMediaArgs
 ): Promise<{ buffer: Buffer; contentType: string }> {
   const { downloadUrl, accessToken } = args
+  if (isWahaUrl(downloadUrl)) return wahaDownload(downloadUrl)
   const response = await fetch(downloadUrl, {
     headers: { Authorization: `Bearer ${accessToken}` },
   })

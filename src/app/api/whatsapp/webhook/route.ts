@@ -126,6 +126,11 @@ interface WhatsAppWebhookEntry {
         parent_user_id?: string
       }>
       messages?: WhatsAppMessage[]
+      /**
+       * Conexão por QR Code (WAHA): mensagens enviadas fora do CRM, pelo
+       * celular ou por outro aparelho conectado. `from` é o cliente.
+       */
+      message_echoes?: Array<WhatsAppMessage & { to?: string }>
       statuses?: Array<{
         id: string
         status: string
@@ -341,8 +346,9 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
         }
       }
 
-      // Handle incoming messages
-      if (!value.messages || !value.contacts) continue
+      // Handle incoming messages (and, on the QR Code connection, the ones
+      // the clinic sent from the phone)
+      if ((!value.messages && !value.message_echoes) || !value.contacts) continue
 
       const phoneNumberId = value.metadata.phone_number_id
 
@@ -385,8 +391,19 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
 
       const decryptedAccessToken = decrypt(config.access_token)
 
-      for (let i = 0; i < value.messages.length; i++) {
-        const message = value.messages[i]
+      for (const echo of value.message_echoes ?? []) {
+        await processEcho(
+          echo,
+          config.account_id,
+          config.user_id,
+          decryptedAccessToken,
+          config.mirror_inbound_media !== false
+        )
+      }
+
+      const inboundMessages = value.messages ?? []
+      for (let i = 0; i < inboundMessages.length; i++) {
+        const message = inboundMessages[i]
         const contact = value.contacts[i] || value.contacts[0]
 
         await processMessage(
@@ -514,7 +531,19 @@ async function lookupInternalIdByMetaId(
     console.error('[webhook] lookupInternalIdByMetaId failed:', error.message)
     return null
   }
-  return data?.id ?? null
+  if (data?.id) return data.id
+  // QR Code connection: a quote carries only the raw WhatsApp ID, while
+  // the CRM stores WAHA's full id (`<fromMe>_<chat>_<ID>`).
+  if (/^[A-Za-z0-9]{8,}$/.test(metaId)) {
+    const { data: rows } = await supabaseAdmin()
+      .from('messages')
+      .select('id')
+      .eq('conversation_id', conversationId)
+      .like('message_id', `%_${metaId}`)
+      .limit(1)
+    return rows?.[0]?.id ?? null
+  }
+  return null
 }
 
 /**
@@ -930,6 +959,90 @@ async function processMessage(
     content_type: contentType,
     text: contentText,
   })
+}
+
+/**
+ * QR Code connection (WAHA): a message the clinic sent from the phone or
+ * another linked device. Stored as an agent message so the thread shows
+ * the whole conversation. No unread bump, no automations, no AI — it is
+ * not the customer talking.
+ */
+async function processEcho(
+  message: WhatsAppMessage & { to?: string },
+  accountId: string,
+  configOwnerUserId: string,
+  accessToken: string,
+  mirrorMedia: boolean
+) {
+  const identity = resolveInboundIdentity(message, undefined)
+  if (!hasUsableIdentity(identity)) return
+  const contactOutcome = await findOrCreateContact(accountId, configOwnerUserId, identity)
+  if (!contactOutcome) return
+  const convResult = await findOrCreateConversation(
+    accountId,
+    configOwnerUserId,
+    contactOutcome.contact.id
+  )
+  if (!convResult) return
+  const conversation = convResult.conversation
+
+  // The same send can be recorded with the chat in another format
+  // (phone vs @lid), so dedupe on the raw WhatsApp ID.
+  const rawId = message.id.split('_')[2] || message.id
+  const { data: existing } = await supabaseAdmin()
+    .from('messages')
+    .select('id')
+    .eq('conversation_id', conversation.id)
+    .like('message_id', `%${rawId}%`)
+    .limit(1)
+  if (existing && existing.length > 0) return
+
+  const { contentText, mediaUrl, mediaType } = await parseMessageContent(
+    message,
+    accessToken,
+    mirrorMedia ? { accountId } : null
+  )
+  const ALLOWED = new Set(['text', 'image', 'document', 'audio', 'video', 'location'])
+  const contentType = ALLOWED.has(message.type)
+    ? message.type
+    : message.type === 'sticker'
+      ? 'image'
+      : 'text'
+  let replyToInternalId: string | null = null
+  if (message.context?.id) {
+    replyToInternalId = await lookupInternalIdByMetaId(message.context.id, conversation.id)
+  }
+  const sentAt = new Date(parseInt(message.timestamp) * 1000).toISOString()
+
+  const { error } = await supabaseAdmin()
+    .from('messages')
+    .upsert(
+      {
+        conversation_id: conversation.id,
+        sender_type: 'agent',
+        content_type: contentType,
+        content_text: contentText,
+        media_url: mediaUrl,
+        media_type: mediaType,
+        message_id: message.id,
+        status: 'sent',
+        created_at: sentAt,
+        reply_to_message_id: replyToInternalId,
+      },
+      { onConflict: 'conversation_id,message_id', ignoreDuplicates: true }
+    )
+  if (error) {
+    console.error('[webhook] error inserting phone-sent message:', error)
+    return
+  }
+  await supabaseAdmin()
+    .from('conversations')
+    .update({
+      last_message_text: contentText || `[${message.type}]`,
+      last_message_at: sentAt,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', conversation.id)
 }
 
 async function parseMessageContent(
